@@ -1,0 +1,215 @@
+import re
+import hashlib
+from datetime import timezone
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+import dateparser
+from typing import Optional, List
+
+BASE = "https://sweepstakesfanatics.com"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; SweepsRadar/1.0; +https://example.com/bot)"
+}
+
+LABEL_PATTERNS = {
+    "entry_frequency": re.compile(r"(entry\s*frequency|ntry\s*frequency|frequency)\s*:", re.I),
+    "eligibility": re.compile(r"(eligibility)\s*:", re.I),
+    "start_date": re.compile(r"(start\s*date|begins|open\s*from)\s*:", re.I),
+    "end_date": re.compile(r"(end\s*date|ends|deadline)\s*:", re.I),
+}
+
+def _get_soup(url: str) -> BeautifulSoup:
+    r = requests.get(url, timeout=25, headers=HEADERS)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "lxml")
+
+def _text(t) -> str:
+    return re.sub(r"\s+", " ", (t or "").strip())
+
+def _first_external_link(content: BeautifulSoup) -> Optional[str]:
+    """
+    Grab the 'enter' link: usually an external URL inside the post content.
+    Heuristics: first anchor whose hostname != sweepstakesfanatics.com
+    Prefer anchors with enter/official/click here text.
+    """
+    links = content.select("a[href]")
+    scored = []
+    for a in links:
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        abs_url = urljoin(BASE, href)
+        host = urlparse(abs_url).hostname or ""
+        if "sweepstakesfanatics.com" in host:
+            continue
+        text = _text(a.get_text(" "))
+        score = 0
+        if re.search(r"\b(enter|official|submit|click here)\b", text, re.I):
+            score += 5
+        if re.search(r"sweep|contest|giveaway|promo|win", text, re.I):
+            score += 2
+        scored.append((score, abs_url))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (-x[0]))
+    return scored[0][1]
+
+def _og_image(soup: BeautifulSoup) -> Optional[str]:
+    m = soup.select_one('meta[property="og:image"][content]')
+    if m and m.get("content"):
+        return m["content"].strip()
+    c = soup.select_one("article .entry-content") or soup.select_one(".entry-content")
+    if c:
+        im = c.select_one("img[src]")
+        if im:
+            return urljoin(BASE, im["src"])
+    return None
+
+def _og_title(soup: BeautifulSoup) -> Optional[str]:
+    m = soup.select_one('meta[property="og:title"][content]')
+    return m["content"].strip() if m and m.get("content") else None
+
+def _parse_labeled_fields(content: BeautifulSoup) -> dict:
+    """
+    Look for lines like 'Eligibility: ...' across p/li/div/strong/etc.
+    Returns dict with keys: entry_frequency, eligibility, start_date, end_date
+    """
+    result = {k: None for k in LABEL_PATTERNS.keys()}
+
+    for el in content.find_all(["p", "li", "div", "span", "strong", "b"]):
+        txt = _text(el.get_text(" "))
+        if not txt or ":" not in txt:
+            continue
+        for key, pat in LABEL_PATTERNS.items():
+            m = pat.search(txt)
+            if m:
+                parts = txt.split(":", 1)
+                if len(parts) == 2:
+                    val = _text(parts[1])
+                    if val:
+                        result[key] = val
+                break
+
+    if any(v is None for v in result.values()):
+        for dt in content.find_all("dt"):
+            label = _text(dt.get_text(" "))
+            dd = dt.find_next_sibling("dd")
+            val = _text(dd.get_text(" ")) if dd else None
+            line = f"{label}: {val}" if val else label
+            for key, pat in LABEL_PATTERNS.items():
+                if pat.search(line):
+                    result[key] = val
+
+    return result
+
+def _parse_dates(raw: Optional[str]):
+    if not raw:
+        return None
+    dt = dateparser.parse(
+        raw,
+        settings={
+            "TIMEZONE": "UTC",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "PREFER_DAY_OF_MONTH": "first"
+        }
+    )
+    return dt
+
+def parse_detail(url: str) -> dict:
+    """
+    Parse a single SweepstakesFanatics post page into a structured dict.
+    """
+    soup = _get_soup(url)
+
+    title = None
+    h1 = soup.select_one("h1.entry-title") or soup.select_one("h1")
+    if h1:
+        title = _text(h1.get_text(" "))
+    if not title:
+        title = _og_title(soup) or "Untitled"
+
+    content = soup.select_one("article .entry-content") or soup.select_one(".entry-content") or soup
+    image_url = _og_image(soup)
+
+    prize_summary = None
+    for p in content.find_all("p"):
+        t = _text(p.get_text(" "))
+        if re.search(r"\b(\$[0-9]|winners?|prize|cash|gift|card)\b", t, re.I):
+            prize_summary = t
+            break
+    if not prize_summary:
+        prize_summary = _text(content.get_text(" "))[:400]
+
+    labeled = _parse_labeled_fields(content)
+    entry_frequency = labeled.get("entry_frequency")
+    eligibility = labeled.get("eligibility")
+    start_date_raw = labeled.get("start_date")
+    end_date_raw = labeled.get("end_date")
+
+    start_date = _parse_dates(start_date_raw)
+    end_date = _parse_dates(end_date_raw)
+
+    entry_link = _first_external_link(content)
+
+    pid = hashlib.sha1(url.encode()).hexdigest()
+
+    return {
+        "id": pid,
+        "source": url,
+        "title": title,
+        "prize_summary": prize_summary,
+        "entry_frequency": entry_frequency,
+        "eligibility": eligibility,
+        "start_date": start_date,
+        "end_date": end_date,
+        "entry_link": entry_link,
+        "image_url": image_url,
+    }
+
+def list_recent(n=40, pages=3) -> List[str]:
+    """
+    Crawl the first `pages` of the site and return up to `n` post URLs.
+    Tries multiple selectors so it's resilient to theme tweaks.
+    """
+    from urllib.parse import urljoin
+    import re
+
+    urls, seen = [], set()
+
+    def add_url(u: str):
+        if not u:
+            return
+        # Only keep post-like URLs, skip tags/categories/etc.
+        if re.search(r"/\d{4}/\d{2}/", u) or re.search(r"/[^/]+-sweepstakes/?$", u):
+            if u not in seen:
+                urls.append(u); seen.add(u)
+
+    for p in range(1, pages + 1):
+        url = BASE if p == 1 else f"{BASE}/page/{p}/"
+        soup = _get_soup(url)
+
+        # Preferred: WordPress <article> cards
+        for art in soup.select("article"):
+            # common WP patterns for the main post link
+            a = art.select_one("h2.entry-title a, h3.entry-title a, .entry-title a, a")
+            if a and a.get("href"):
+                add_url(urljoin(BASE, a["href"]))
+
+        # Fallbacks if <article> didn’t match enough
+        if len(urls) < n:
+            for a in soup.select("h2 a, h3 a, .post a, .card a, a"):
+                href = a.get("href", "")
+                if not href:
+                    continue
+                abs_url = urljoin(BASE, href)
+                add_url(abs_url)
+                if len(urls) >= n:
+                    break
+
+        if len(urls) >= n:
+            break
+
+    return urls[:n]

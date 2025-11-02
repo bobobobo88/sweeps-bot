@@ -1,5 +1,11 @@
 import requests
-from zoneinfo import ZoneInfo  # Python 3.9+
+from typing import List, Dict
+
+# ZoneInfo is stdlib in 3.9+; for 3.8 we use the backport
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # Python 3.8
 
 LOCAL_TZ = ZoneInfo("America/Chicago")
 
@@ -21,9 +27,11 @@ def build_embed(item: dict) -> dict:
     if item.get("end_date"):
         fields.append({"name": "End Date", "value": _fmt_dt(item["end_date"]), "inline": True})
 
-    desc = f"[Open Post]({item['source']})"
+        desc = f"[Open Post]({item['source']})"
     if item.get("entry_link"):
         desc += f" • [Enter Here]({item['entry_link']})"
+    if item.get("rules_link"):
+        desc += f" • [Rules]({item['rules_link']})"
 
     embed = {
         "title": item.get("title", "Sweepstakes"),
@@ -37,7 +45,7 @@ def build_embed(item: dict) -> dict:
 
     return embed
 
-def send_webhook(webhook_url: str, embeds: list[dict]):
+def send_webhook(webhook_url: str, embeds: List[Dict]):
     # Discord: max 10 embeds per request
     for i in range(0, len(embeds), 10):
         payload = {"embeds": embeds[i:i+10]}

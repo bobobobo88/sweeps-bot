@@ -1,4 +1,5 @@
 import sqlite3
+from typing import Optional
 from contextlib import closing
 
 def get_db(path="data.db"):
@@ -17,7 +18,7 @@ def seen(conn, pid: str) -> bool:
         cur.execute("SELECT 1 FROM posts WHERE id=?", (pid,))
         return cur.fetchone() is not None
 
-def save(conn, pid: str, url: str, title: str, deadline_iso: str | None):
+def save(conn, pid: str, url: str, title: str, deadline_iso: Optional[str]):
     with closing(conn.cursor()) as cur:
         cur.execute(
             "INSERT OR IGNORE INTO posts (id,url,title,deadline_utc) VALUES (?,?,?,?)",
