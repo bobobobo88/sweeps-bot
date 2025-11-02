@@ -1,28 +1,25 @@
 import os
 import argparse
 import traceback
+from discord_out import build_error_embed, send_alert
 from datetime import timezone
 from typing import List
 
 from storage import get_db, seen, save
-from discord_out import build_embed, send_webhook, build_error_embed, send_alert
+from discord_out import build_embed, send_webhook
 from sites import list_sites, load_module, site_webhook, site_limit, site_pages
 
-
 def _alert(site_key: str, stage: str, exc: Exception):
-    """Send a red alert embed (and print) on any failure."""
     alert_webhook = os.environ.get("ALERT_WEBHOOK_URL") or os.environ.get("ERROR_WEBHOOK_URL")
-    msg = f"{type(exc).__name__}: {exc}"
-    print(f"[alert] {site_key} {stage}: {msg}")
     if not alert_webhook:
+        print(f"[alert] (no ALERT_WEBHOOK_URL) {site_key} {stage}: {exc}")
         return
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    embed = build_error_embed(site_key, stage, msg, tb)
+    embed = build_error_embed(site_key, stage, str(exc), tb)
     try:
         send_alert(alert_webhook, [embed])
-    except Exception as e2:
-        print(f"[alert] failed to send alert: {e2}")
-
+    except Exception as e:
+        _alert(site_key, "send_webhook", e)
 
 def run_for_site(site_key: str, default_limit: int, default_pages: int, dry: bool):
     mod = load_module(site_key)
@@ -34,80 +31,60 @@ def run_for_site(site_key: str, default_limit: int, default_pages: int, dry: boo
 
     print(f"\n===== [{site_key}] DB_PATH={db_path} webhook? {'yes' if bool(webhook) else 'NO'} limit={limit} pages={pages}")
     if not webhook and not dry:
-        raise RuntimeError(
-            f"No webhook for site {site_key}. Set {site_key.upper()}_WEBHOOK_URL or DISCORD_WEBHOOK_URL."
-        )
+        raise RuntimeError(f"No webhook for site {site_key}. Set {site_key.upper()}_WEBHOOK_URL or DISCORD_WEBHOOK_URL.")
 
     conn = get_db(db_path)
-
-    # list_recent with protection
-    try:
-        urls: List[str] = mod.list_recent(n=limit, pages=pages)
-    except Exception as e:
-        _alert(site_key, "list_recent", e)
-        return
-
+    urls: List[str] = mod.list_recent(n=limit, pages=pages)
     print(f"[{site_key}] discovered {len(urls)} urls")
 
     embeds = []
     new_count = 0
-
     for u in urls:
-        # parse_detail protected per URL
-        try:
-            item = mod.parse_detail(u)
-        except Exception as e:
-            _alert(site_key, f"parse_detail({u})", e)
-            continue
-
+    try:
+        item = mod.parse_detail(u)
+    except Exception as e:
+        _alert(site_key, f"parse_detail({u})", e)
+        continue
         if seen(conn, item["id"]):
             print(f"[{site_key}] skip seen -> {u}")
             continue
-
         new_count += 1
         print(f"[{site_key}] new -> {item['title']} -> {u}")
-
         if not dry:
-            try:
-                embeds.append(build_embed(item))
-            except Exception as e:
-                _alert(site_key, f"build_embed({u})", e)
-
+            embeds.append(build_embed(item))
         deadline_iso = item["end_date"].astimezone(timezone.utc).isoformat() if item.get("end_date") else None
         save(conn, item["id"], item["source"], item["title"], deadline_iso)
 
     if dry:
         print(f"[{site_key}] [dry] would post {len(embeds)} embeds (new={new_count})")
-        return
-
-    if embeds:
-        print(f"[{site_key}] posting {len(embeds)} embeds...")
-        try:
+    else:
+        if embeds:
+            print(f"[{site_key}] posting {len(embeds)} embeds...")
             send_webhook(webhook, embeds)
             print(f"[{site_key}] posted.")
-        except Exception as e:
-            _alert(site_key, "send_webhook", e)
-    else:
-        print(f"[{site_key}] nothing new to post.")
-
+        else:
+            print(f"[{site_key}] nothing new to post.")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["recent", "dry"], default="recent")
-    ap.add_argument("--sites", default="all", help="Comma list or 'all'. e.g. fanatics,stoday,freebieshark")
+    ap.add_argument("--mode", choices=["recent","dry"], default="recent")
+    ap.add_argument("--sites", default="all", help="Comma list or 'all'. e.g. fanatics,stoday")
     ap.add_argument("--site", help="(back-compat) single site or 'both'")
     ap.add_argument("--limit", type=int, default=12)
     ap.add_argument("--pages", type=int, default=3)
     args = ap.parse_args()
 
-    # Back-compat shim for older --site flag
+    # Back-compat shim: if --site is used, map it to --sites
     if args.site:
-        target_sites = list_sites() if args.site == "both" else [args.site]
+        if args.site == "both":
+            target_sites = list_sites()
+        else:
+            target_sites = [args.site]
     else:
         target_sites = list_sites() if args.sites == "all" else [s.strip() for s in args.sites.split(",") if s.strip()]
 
     for s in target_sites:
-        try:
-            run_for_site(s, default_limit=args.limit, default_pages=args.pages, dry=(args.mode == "dry"))
-        except Exception as e:
-            _alert(s, "run_for_site", e)
+    try:
+        run_for_site(s, default_limit=args.limit, default_pages=args.pages, dry=(args.mode == "dry"))
+    except Exception as e:
+        _alert(s, "run_for_site", e)
